@@ -1,0 +1,53 @@
+[preliminary_baseline_agent]
+name = "preliminary_baseline_agent"
+sleep_between_steps = 2.0
+log_dir = "logs"
+tongsim_server_endpoint = "127.0.0.1:50060"
+
+[final_baseline_agent]
+name = "final_baseline_agent"
+sleep_between_steps = 2.0
+log_dir = "logs"
+tongsim_server_endpoint = "127.0.0.1:50060"
+
+[tidy_room_agent]
+name = "tidy_room_agent"
+sleep_between_steps = 0.3
+log_dir = "logs"
+tongsim_server_endpoint = "127.0.0.1:50060"
+# vlm_config.py __ALL__ 中的配置类名；API Key/地址/模型名建议用环境变量 VLM_CLIENT_CFG_* 覆盖
+vlm_model = "VLMGPT5Config"
+# 兜底参数：题目限时 400s，预算留出余量
+time_budget_s = 330.0
+max_steps = 120
+max_take_attempts = 2
+max_put_attempts = 3
+max_vlm_fail_streak = 3
+
+[counting_agent]
+name = "counting_agent"
+sleep_between_steps = 0.2
+log_dir = "logs"
+tongsim_server_endpoint = "127.0.0.1:50060"
+vlm_model = "VLMGPT5Config"
+time_budget_s = 300.0
+run_budget_s = 3600.0
+max_vlm_fail_streak = 3
+# 原地一圈
+sweep_turn_degrees = 120.0
+sweep_views = 3
+turn_settle_s = 0.12
+# 巡游按“时间”封顶建清单：走到物体旁复扫；优先看全(答对)，仍设上限避免拖爆400s单题时限
+explore_time_budget_s = 200.0
+max_waypoints = 12
+waypoint_no_gain_stop = 4
+# 多题节奏：答对才推进；evaluate 后等题号变化的宽限
+max_attempts_per_subject = 4
+advance_wait_s = 6.0
+perceive_width = 480
+perceive_height = 400
+max_inventory_items = 200
+max_answer_images = 5
+
+[grpc]
+endpoint = "127.0.0.1:50051"

@@ -1,0 +1,19 @@
+# 环境 / 依赖
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# 运行产物
+logs/
+*.log
+.counting_inventory.json
+eval_res*.json
+result_*.bin
+result_package.bin
+protobf/
+
+# 密钥（保险起见，即便脚本已改为读环境变量）
+.env
+*.secret
