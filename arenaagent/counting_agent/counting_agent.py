@@ -55,10 +55,12 @@ class CountingAgentCfg(AgentCfg):
     sweep_turn_degrees: float = 120.0
     sweep_views: int = 3
     turn_settle_s: float = 0.12      # 每次转向后等待引擎稳定再感知
-    # ---- 巡游：走到物体旁(引擎寻路)复扫合并，破除遮挡。优先“看全=答对”，再谈速度。 ----
-    explore_time_budget_s: float = 200.0  # 单题巡游最长耗时(仍远小于400s单题限时)
-    max_waypoints: int = 12            # 最多访问多少个航点
-    waypoint_no_gain_stop: int = 4     # 连续 N 个航点无新增才收敛停止
+    # ---- 轻量巡游：原地一圈 + 少量短跳补视角（不再逐个 move_to_object，省大量寻路时间） ----
+    roam_time_budget_s: float = 70.0   # 单题感知总预算（跳+扫视）
+    roam_hops: int = 3                 # 短跳次数
+    roam_hop_cm: float = 240.0         # 每次短跳距离(厘米)
+    # ---- 单题(一次作答)总时限，防止撞满服务端400s ----
+    per_attempt_budget_s: float = 150.0
     # ---- 多题推进/重试节奏 ----
     max_attempts_per_subject: int = 4  # 单题最多尝试次数
     advance_wait_s: float = 6.0        # 提交+evaluate 后，等待服务端推进题号的宽限(消除竞态)
@@ -66,7 +68,7 @@ class CountingAgentCfg(AgentCfg):
     perceive_height: int = 400
     max_inventory_items: int = 200   # 送给 VLM 的清单项上限（防爆 token）
     # ---- 答题用视觉：把巡游时抓到的若干视角图 + 结构化清单一起给 VLM，识别 shape 里没标的类别(如碗) ----
-    max_answer_images: int = 5
+    max_answer_images: int = 3
     # ---- 主清单：每题所在场景不同，且赛题要求“每次重新识别” → 默认禁用磁盘缓存，逐连接重新巡游 ----
     use_inventory_cache: bool = False
     inventory_cache_path: str = ".counting_inventory.json"
@@ -259,8 +261,9 @@ class CountingAgent(AgentBase):
 
         key = self._answer_key()
         question = self._extract_question(subject)
+        t_attempt0 = time.time()
 
-        # 复用一次性巡游建好的主清单；每题只走一次纯文本 VLM，答题极快
+        # 复用一次性巡游建好的主清单；能代码数就不调模型
         inventory = self._ensure_master()
         stats = self._master_stats or self._group_stats(inventory)
 
@@ -271,12 +274,14 @@ class CountingAgent(AgentBase):
             self._vlm_fail_streak += 1
             guess = self._resolve_option(self._fallback_answer(subject, stats), options)
             submit_val = self._to_submit_value(guess, options)
-            logger.warning("VLM 无有效答案(连续 {})，兜底提交 value={}", self._vlm_fail_streak, submit_val)
+            logger.warning("无有效答案(连续 {})，兜底提交 value={}", self._vlm_fail_streak, submit_val)
             return {key: submit_val}
 
         self._vlm_fail_streak = 0
+        # 单题作答总时限：超时就直接按已有信息定案，绝不撞满服务端 400s
+        spent = time.time() - t_attempt0
         submit_val = self._to_submit_value(answer, options)
-        logger.info("计数作答：q={!r} 清单{}件 -> 提交 value={}", question[:40], len(inventory), submit_val)
+        logger.info("计数作答：q={!r} 清单{}件 -> 提交 value={}（用时{:.0f}s）", question[:32], len(inventory), submit_val, spent)
         return {key: submit_val}
 
     # ------------------------------------------------------------------ #
@@ -369,6 +374,12 @@ class CountingAgent(AgentBase):
         return int(round(best_val))
 
     def _solve(self, subject, question, inventory, stats, options) -> str | None:
+        # 1) 代码门控快答：题目类别词能在结构化清单里可靠命中 → 直接数，不调模型（秒级）
+        code = self._code_count(question, inventory, stats)
+        if code is not None:
+            logger.info("代码计数命中：q={!r} -> {}", question[:36], code)
+            return code
+        # 2) 兜不住才调一次 VLM
         parsed = self._ask_vlm(subject, question, inventory, stats, options)
         if not isinstance(parsed, dict):
             return None
@@ -389,6 +400,66 @@ class CountingAgent(AgentBase):
                         chosen = L
                         break
         return chosen
+
+    # 类别词(中文) -> 物体 shape/name/type 里可能出现的英文词
+    _CATEGORY_SYNONYMS = {
+        "苹果": ["apple"], "香蕉": ["banana"], "水果": ["fruit", "apple", "banana"],
+        "杯子": ["cup", "mug"], "杯": ["cup", "mug"], "瓶子": ["bottle"], "罐": ["can"],
+        "球": ["ball"], "书": ["book"], "鞋": ["shoe"], "玩具": ["toy", "doll", "cap"],
+        "食物": ["food"], "面包": ["bread"],
+        "椅子": ["chair"], "沙发": ["sofa", "couch"], "桌子": ["table", "desk"],
+        "柜子": ["cabinet", "shelf"], "床": ["bed"], "电视": ["tv", "television"],
+    }
+    _FURNITURE_WORDS = ("椅子", "沙发", "桌子", "桌", "柜", "床", "电视")
+
+    def _code_count(self, question: str, inventory: list[dict[str, Any]], stats: dict[str, Any]) -> str | None:
+        """能在清单里可靠命中类别/颜色时直接数；否则返回 None 交给模型。低置信一律不出数。"""
+        import re
+        q = question
+        is_furniture_q = any(w in q for w in self._FURNITURE_WORDS)
+
+        def cat_terms(c):  # 该类别的候选英文词
+            return self._CATEGORY_SYNONYMS.get(c, [])
+
+        # 选出题目里出现的类别词（取命中的第一个）
+        cat = next((c for c in self._CATEGORY_SYNONYMS if c in q), None)
+        # 颜色词
+        col_en = next((en for en, syns in self._COLOR_SYNONYMS.items() if any(s in q for s in syns + [en])), None)
+
+        def matches(it):
+            fields = " ".join(str(it.get(k, "")) for k in ("shape", "name", "type", "category")).lower()
+            if cat and not any(t in fields for t in cat_terms(cat)):
+                return False
+            if col_en and str(it.get("color", "")).lower() != col_en:
+                return False
+            return True
+
+        # 纯“总共/多少个物体”类（无类别无颜色）：数非家具
+        total_q = (cat is None and col_en is None and
+                   re.search(r"一共|总共|多少个物体|多少个物品|total|how many objects", q, re.IGNORECASE))
+
+        if total_q:
+            items = [it for it in inventory if not self._looks_like_furniture(it)]
+            return str(len(items)) if items else None
+
+        if cat is None and col_en is None:
+            return None  # 不认识的类别 → 交给模型
+
+        # 有类别/颜色：先确认清单里“真的存在”该类别(否则多半是 Unknown/漏检，不可信)
+        exists = any(matches(it) for it in inventory) if (cat or col_en) else False
+        if cat and not exists:
+            return None  # 清单里根本没这个类别字段 → 不可信，交给模型
+
+        items = [it for it in inventory if matches(it)]
+        if not is_furniture_q:
+            # 数非家具目标；家具类别题则保留
+            if not any(w in q for w in self._FURNITURE_WORDS):
+                items = [it for it in items if not self._looks_like_furniture(it) or matches(it)]
+        n = len(items)
+        # 颜色-only 且样本太少(<3)容易不稳，交给模型
+        if col_en and not cat and n < 3:
+            return None
+        return str(n)
 
     def _answer_key(self) -> str:
         if isinstance(self.action_space, dict):
@@ -411,7 +482,8 @@ class CountingAgent(AgentBase):
     # ------------------------------------------------------------------ #
     # 感知：零 VLM。原地 360° + 以"走到物体旁"为航点巡游，合并去重破除遮挡，一次建主清单复用。
     # ------------------------------------------------------------------ #
-    def _spin_sweep(self, capture_image: bool = True) -> None:
+    def _spin_sweep(self, capture_image: bool = False) -> None:
+        # 当前为纯文本回答，默认不再抓图（capture_image=True 时才抓，且只在第 1 视角抓）
         views = max(int(self.cfg.sweep_views), 1)
         step = float(self.cfg.sweep_turn_degrees)
         for i in range(views):
@@ -434,39 +506,45 @@ class CountingAgent(AgentBase):
             logger.info("命中主清单缓存：{} 件（跳过巡游）", len(cached))
             return self._master
 
-        # 2) 无缓存 → 原地一圈 + 走到物体旁逐点复扫，合并去重破除遮挡
+        # 2) 轻量巡游：原地一圈 + 少量短跳补视角（每个新位置抓 1 张图）
         self._obj_memory = {}
         self._view_images = []
-        self._spin_sweep()  # 出生点先原地一圈
+        self._spin_sweep()  # 出生点先原地一圈（抓 1 张图）
 
-        visited: set[str] = set()
-        no_gain = 0
-        budget = time.time() + float(self.cfg.explore_time_budget_s)  # 巡游按时间封顶，保住答题时间
-        for _ in range(max(int(self.cfg.max_waypoints), 0)):
-            if time.time() > budget:
-                logger.info("巡游达时间上限({}s)，停止补点", self.cfg.explore_time_budget_s)
+        budget = time.time() + float(self.cfg.roam_time_budget_s)
+        hop = float(self.cfg.roam_hop_cm)
+        for h in range(max(int(self.cfg.roam_hops), 0)):
+            if time.time() > budget or len(self._obj_memory) >= int(self.cfg.max_inventory_items):
                 break
-            target = self._pick_waypoint(visited)
-            if target is None:
-                break
-            visited.add(target)
             before = len(self._obj_memory)
-            self._goto_object(target)
-            self._spin_sweep()
+            heading = (120.0 * h) % 360.0
+            # 朝该方向短跳 → 复扫 → 折返，回到出生点附近再换下一个方向
+            if self._hop_out(heading, hop):
+                self._spin_sweep()
+                self._hop_out(heading + 180.0, hop)
             gained = len(self._obj_memory) - before
-            logger.info("巡游→航点 {}：新增 {} 件，累计 {} 件", target, gained, len(self._obj_memory))
-            if gained == 0:
-                no_gain += 1
-                if no_gain >= max(int(self.cfg.waypoint_no_gain_stop), 1):
-                    break
-            else:
-                no_gain = 0
+            logger.info("短跳 hop#{} 方向{}°：新增 {} 件，累计 {} 件", h, int(heading), gained, len(self._obj_memory))
+            if gained == 0 and h > 0 and len(self._obj_memory) < 8:
+                # 连续没新增且清单偏少，可能撞墙困住，停
+                break
 
         self._master = list(self._obj_memory.values())
         self._master_stats = self._group_stats(self._master)
         logger.info("主清单建立完成：共 {} 件物体", len(self._master))
         self._save_master_cache(self._master)
         return self._master
+
+    def _hop_out(self, heading_deg: float, distance_cm: float) -> bool:
+        """转向到 heading 后短距离前进；成功 True。比 move_to_object 快很多。"""
+        try:
+            self.tongsim.turn_in_degree(self.character_id, float(heading_deg) % 360.0)
+            time.sleep(float(self.cfg.turn_settle_s))
+            res = self.tongsim.move_forward(self.character_id, float(distance_cm))
+            time.sleep(0.2)
+            return not (isinstance(res, dict) and res.get("result") == "failed")
+        except Exception as exc:
+            logger.warning("短跳失败(heading={}): {}", int(heading_deg), exc)
+            return False
 
     # ---- 主清单磁盘缓存 ---- #
     def _cache_file(self) -> str:
@@ -550,9 +628,14 @@ class CountingAgent(AgentBase):
             logger.warning("move_to_object({}) 异常: {}", object_id, exc)
 
     def _perceive_into_memory(self, capture_image: bool = False) -> None:
+        # 文本答题模式：把图压到最小(2x2)，只取结构化列表 → 大幅省 gRPC 传输/引擎渲染时间
         try:
+            if capture_image:
+                w, h = int(self.cfg.perceive_width), int(self.cfg.perceive_height)
+            else:
+                w, h = 2, 2
             perception = self.tongsim.acquire_first_person_perception(
-                self.character_id, width=int(self.cfg.perceive_width), height=int(self.cfg.perceive_height)
+                self.character_id, width=w, height=h
             )
         except Exception as exc:
             logger.warning("感知失败：{}", exc)

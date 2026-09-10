@@ -37,10 +37,11 @@ max_vlm_fail_streak = 3
 sweep_turn_degrees = 120.0
 sweep_views = 3
 turn_settle_s = 0.12
-# 巡游按“时间”封顶建清单：走到物体旁复扫；优先看全(答对)，仍设上限避免拖爆400s单题时限
-explore_time_budget_s = 200.0
-max_waypoints = 12
-waypoint_no_gain_stop = 4
+# 轻量巡游：原地一圈 + 少量短跳(快)，取代逐个 move_to_object(慢寻路)
+roam_time_budget_s = 70.0
+roam_hops = 3
+roam_hop_cm = 240.0
+per_attempt_budget_s = 150.0
 # 多题节奏：答对才推进；evaluate 后等题号变化的宽限
 max_attempts_per_subject = 4
 advance_wait_s = 6.0
