@@ -40,9 +40,10 @@ class TongSimGrpcClient(TongSimInterface):
         )
         self._heartbeat_thread.start()
 
-    def _call(self, method_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _call(self, method_name: str, payload: dict[str, Any], timeout_s: float = 30.0) -> dict[str, Any]:
         rpc = getattr(self._stub, method_name)
-        return parse_struct_to_data(rpc(pack_data_to_struct(payload), metadata=self._metadata))
+        # 加超时：引擎/服务卡死时快速失败，而不是无限阻塞 agent
+        return parse_struct_to_data(rpc(pack_data_to_struct(payload), metadata=self._metadata, timeout=timeout_s))
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.is_set():
@@ -212,6 +213,7 @@ class TongSimGrpcClient(TongSimInterface):
                 "character_id": str(character_id),
                 "object_id": object_id,
             },
+            timeout_s=120.0,
         )
 
     def move_to_npc(self, character_id, name: str):

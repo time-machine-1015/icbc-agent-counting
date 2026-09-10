@@ -104,6 +104,7 @@ class CountingAgent(AgentBase):
         self._obj_memory: dict[str, dict[str, Any]] = {}
         # 巡游时抓取的视角图(base64 data url)，答题时作为视觉证据一起给 VLM
         self._view_images: list[str] = []
+        self._perceive_fail_streak: int = 0
         # 全场景主清单：一次性巡游建好，10 题共用（场景静态），后续题目只走一次纯文本 VLM
         self._master: list[dict[str, Any]] | None = None
         self._master_stats: dict[str, Any] | None = None
@@ -172,8 +173,11 @@ class CountingAgent(AgentBase):
         last_idx: int | None = None
         attempts = 0
 
-        # 一次性巡游建主清单
-        self._ensure_master()
+        # 一次性巡游建主清单（感知故障则重试，不拿空清单去答题）
+        if not self._build_master_with_retry(t0_start_hint := t0):
+            logger.error("感知持续故障(tongsim/UE 可能已挂)，提前结束本场，不提交垃圾答案")
+            self._disconnect()
+            return
 
         while (time.time() - t0) < run_budget:
             if self._session_over():
@@ -182,6 +186,14 @@ class CountingAgent(AgentBase):
             if idx is None:
                 time.sleep(0.5)
                 continue
+
+            # 答错重试时若怀疑清单被清空(感知故障)，重建；仍空则快速放弃
+            if attempts > 1 and len(self._answered_inventory_ok()) < 8:
+                if not self._build_master_with_retry(t0):
+                    logger.error("重建清单失败，提前结束本场")
+                    self._disconnect()
+                    return
+
 
             if idx == last_idx:
                 attempts += 1
@@ -534,6 +546,23 @@ class CountingAgent(AgentBase):
         self._save_master_cache(self._master)
         return self._master
 
+    def _build_master_with_retry(self, t_session_start: float, min_items: int = 8, tries: int = 3) -> bool:
+        """带重试的主清单构建：感知故障/清单过空时快速失败返回 False，绝不拿空清单去答题。"""
+        for k in range(tries):
+            self._master = None
+            self._perceive_fail_streak = 0
+            inv = self._ensure_master()
+            if len(inv) >= min_items and self._perceive_fail_streak < 4:
+                return True
+            logger.warning("主清单不可用(件数={}, 感知连续失败={})，第 {} 次重建", len(inv), self._perceive_fail_streak, k + 1)
+            if time.time() - t_session_start > float(self.cfg.run_budget_s) * 0.5:
+                break
+            time.sleep(5.0)
+        return False
+
+    def _answered_inventory_ok(self) -> list[dict[str, Any]]:
+        return self._master or []
+
     def _hop_out(self, heading_deg: float, distance_cm: float) -> bool:
         """转向到 heading 后短距离前进；成功 True。比 move_to_object 快很多。"""
         try:
@@ -637,8 +666,10 @@ class CountingAgent(AgentBase):
             perception = self.tongsim.acquire_first_person_perception(
                 self.character_id, width=w, height=h
             )
+            self._perceive_fail_streak = 0
         except Exception as exc:
-            logger.warning("感知失败：{}", exc)
+            self._perceive_fail_streak = getattr(self, "_perceive_fail_streak", 0) + 1
+            logger.warning("感知失败(连续 {})：{}", self._perceive_fail_streak, exc)
             return
         if capture_image and len(self._view_images) < int(self.cfg.max_answer_images):
             img = perception.get("image")
