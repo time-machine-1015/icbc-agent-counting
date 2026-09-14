@@ -55,20 +55,23 @@ class CountingAgentCfg(AgentCfg):
     sweep_turn_degrees: float = 120.0
     sweep_views: int = 3
     turn_settle_s: float = 0.12      # 每次转向后等待引擎稳定再感知
-    # ---- 轻量巡游：原地一圈 + 少量短跳补视角（不再逐个 move_to_object，省大量寻路时间） ----
-    roam_time_budget_s: float = 70.0   # 单题感知总预算（跳+扫视）
-    roam_hops: int = 3                 # 短跳次数
-    roam_hop_cm: float = 240.0         # 每次短跳距离(厘米)
+    # ---- 航点巡游：首圈拿世界坐标→规划中心/家具前视/四角点，move_to_location 引擎寻路(自动绕墙) ----
+    roam_time_budget_s: float = 95.0  # 单题感知总预算（含导航+扫视）
+    roam_max_points: int = 4           # 3角+中心
+    roam_inset_cm: float = 120.0       # 四角内缩量(厘米)，避免贴墙
     # ---- 单题(一次作答)总时限，防止撞满服务端400s ----
     per_attempt_budget_s: float = 150.0
     # ---- 多题推进/重试节奏 ----
-    max_attempts_per_subject: int = 4  # 单题最多尝试次数
+    max_attempts_per_subject: int = 4  # 单题最多尝试次数(耗尽则换未试过的最可能选项，绝不空等)
     advance_wait_s: float = 6.0        # 提交+evaluate 后，等待服务端推进题号的宽限(消除竞态)
     perceive_width: int = 480        # 感知图(左RGB+右分割带ID)尺寸；平衡 gRPC 负载与可辨识度
     perceive_height: int = 400
     max_inventory_items: int = 200   # 送给 VLM 的清单项上限（防爆 token）
-    # ---- 答题用视觉：把巡游时抓到的若干视角图 + 结构化清单一起给 VLM，识别 shape 里没标的类别(如碗) ----
-    max_answer_images: int = 3
+    # ---- 答题用视觉：巡游抓的视角图+清单一起给 VLM，识别 shape 里没有的类别(碗/钟/瓶) ----
+    max_answer_images: int = 2
+    # ---- 轻量安全网：4点走完后清单过少/模型没答案时，补看最大件家具背视点 ----
+    min_inventory_items: int = 15
+    safety_back_views: int = 2
     # ---- 主清单：每题所在场景不同，且赛题要求“每次重新识别” → 默认禁用磁盘缓存，逐连接重新巡游 ----
     use_inventory_cache: bool = False
     inventory_cache_path: str = ".counting_inventory.json"
@@ -105,6 +108,8 @@ class CountingAgent(AgentBase):
         # 巡游时抓取的视角图(base64 data url)，答题时作为视觉证据一起给 VLM
         self._view_images: list[str] = []
         self._perceive_fail_streak: int = 0
+        self._dead_points: set = set()   # 导航失败点黑名单(同场景重试不再浪费)
+        self._roam_phase: int = 0
         # 全场景主清单：一次性巡游建好，10 题共用（场景静态），后续题目只走一次纯文本 VLM
         self._master: list[dict[str, Any]] | None = None
         self._master_stats: dict[str, Any] | None = None
@@ -130,6 +135,12 @@ class CountingAgent(AgentBase):
         camera_fov = float(opt.get("camera_fov", 120.0))
         camera_width = int(opt.get("camera_width", 1280))
         camera_height = int(opt.get("camera_height", 720))
+        try:
+            self._spawn_z = float(spawn_loc[2])
+            self._spawn_xy = [float(spawn_loc[0]), float(spawn_loc[1])]
+        except Exception:
+            self._spawn_z = 20.0
+            self._spawn_xy = [0.0, 0.0]
         self.character_id = self.tongsim.spawn_character(
             spawn_loc, spawn_rot, opt["name"], camera_fov, camera_width, camera_height
         )
@@ -172,12 +183,8 @@ class CountingAgent(AgentBase):
         run_budget = float(self.cfg.run_budget_s)
         last_idx: int | None = None
         attempts = 0
-
-        # 一次性巡游建主清单（感知故障则重试，不拿空清单去答题）
-        if not self._build_master_with_retry(t0_start_hint := t0):
-            logger.error("感知持续故障(tongsim/UE 可能已挂)，提前结束本场，不提交垃圾答案")
-            self._disconnect()
-            return
+        tried_vals: dict[int, set[int]] = {}   # 每题已提交过的选项值(防重复瞎猜)
+        self._last_est: float | None = None
 
         while (time.time() - t0) < run_budget:
             if self._session_over():
@@ -187,28 +194,56 @@ class CountingAgent(AgentBase):
                 time.sleep(0.5)
                 continue
 
-            # 答错重试时若怀疑清单被清空(感知故障)，重建；仍空则快速放弃
-            if attempts > 1 and len(self._answered_inventory_ok()) < 8:
-                if not self._build_master_with_retry(t0):
-                    logger.error("重建清单失败，提前结束本场")
-                    self._disconnect()
-                    return
-
-
             if idx == last_idx:
                 attempts += 1
             else:
                 attempts, last_idx = 1, idx
-
-            if attempts > int(self.cfg.max_attempts_per_subject):
-                logger.warning("subject idx={} 尝试达上限，等待服务端超时推进", idx)
-                time.sleep(2.0)
-                continue
+                self._roam_phase = 0
+                self._dead_points = set()  # 新场景=新房间，黑名单清零
+                self._master = None          # 新题=新场景，必须重新感知
+                self._master_stats = None
 
             self._refresh_action_space()
             subject = self._get_subject_from_task()
             task_response = self._get_response_from_task()
+            options = self._extract_options(subject)
+            key = self._answer_key()
+
+            # 尝试次数耗尽 → 不再重巡，从未试过的选项里挑最可能的交上去(有机会得分，好过空等400s)
+            if attempts > int(self.cfg.max_attempts_per_subject):
+                probe = self._pick_untried(idx, options, tried_vals)
+                if probe is None:
+                    logger.warning("subject idx={} 选项已试尽，等服务端超时推进", idx)
+                    time.sleep(3.0)
+                    continue
+                tried_vals.setdefault(idx, set()).add(probe)
+                logger.warning("subject idx={} 转试探模式：提交未试过的选项值 {}", idx, probe)
+                self._apply_action({key: probe})
+                time.sleep(0.2)
+                self._safe_evaluate()
+                if self._wait_index_change(idx, float(self.cfg.advance_wait_s)):
+                    logger.info("试探命中！推进到 {}", self._get_current_subject_index())
+                continue
+
+            # 正常作答：新场景/重试都先保证清单新鲜；重试换相位+缩预算，第4次只换问法不再重巡
+            if attempts >= 2:
+                self._roam_phase = attempts
+            if attempts <= 3:
+                self._roam_budget = 90.0 if attempts >= 2 else None
+                self.invalidate_master_cache(silent=True)
+            ok_build = self._build_master_with_retry(t0, force_rebuild=(attempts <= 3))
+            self._roam_budget = None
+            if not ok_build:
+                logger.error("感知持续故障(tongsim/UE 可能已挂)，提前结束本场")
+                self._disconnect()
+                return
+
             action = self.run_step(subject, task_response)
+            try:
+                submit_val = int(str(list(action.values())[0]))
+                tried_vals.setdefault(idx, set()).add(submit_val)
+            except Exception:
+                pass
             self._apply_action(action)
             time.sleep(0.2)
             self._safe_evaluate()
@@ -218,11 +253,22 @@ class CountingAgent(AgentBase):
             if advanced:
                 logger.info("subject idx={} 答对并已推进到 {}", idx, self._get_current_subject_index())
             else:
-                logger.info("subject idx={} 未推进(答错)，补巡游后第 {} 次重试", idx, attempts + 1)
-                # 答错：可能是清单漏检，丢弃缓存强制重新巡游
-                self.invalidate_master_cache()
+                logger.info("subject idx={} 未推进(答错)，第 {} 次重试(换相位重巡)", idx, attempts + 1)
 
         self._disconnect()
+
+    def _pick_untried(self, idx: int, options: dict[str, float], tried: dict[int, set[int]]) -> int | None:
+        """试探模式：未试过的选项值里，选离当前估计值最近的；没估计值选中位。"""
+        vals = [int(v) for v in options.values()]
+        remain = [v for v in vals if v not in tried.get(idx, set())]
+        if not remain:
+            return None
+        est = getattr(self, "_last_est", None)
+        if est is None:
+            remain.sort()
+            return remain[len(remain) // 2]
+        return min(remain, key=lambda v: abs(v - est))
+
 
     def _wait_index_change(self, idx: int, timeout: float) -> bool:
         end = time.time() + timeout
@@ -286,6 +332,7 @@ class CountingAgent(AgentBase):
             self._vlm_fail_streak += 1
             guess = self._resolve_option(self._fallback_answer(subject, stats), options)
             submit_val = self._to_submit_value(guess, options)
+            self._last_est = float(submit_val)
             logger.warning("无有效答案(连续 {})，兜底提交 value={}", self._vlm_fail_streak, submit_val)
             return {key: submit_val}
 
@@ -293,6 +340,7 @@ class CountingAgent(AgentBase):
         # 单题作答总时限：超时就直接按已有信息定案，绝不撞满服务端 400s
         spent = time.time() - t_attempt0
         submit_val = self._to_submit_value(answer, options)
+        self._last_est = float(submit_val)
         logger.info("计数作答：q={!r} 清单{}件 -> 提交 value={}（用时{:.0f}s）", question[:32], len(inventory), submit_val, spent)
         return {key: submit_val}
 
@@ -386,12 +434,16 @@ class CountingAgent(AgentBase):
         return int(round(best_val))
 
     def _solve(self, subject, question, inventory, stats, options) -> str | None:
-        # 1) 代码门控快答：题目类别词能在结构化清单里可靠命中 → 直接数，不调模型（秒级）
+        # 1) 代码门控快答：类别/颜色词能可靠命中，且**数量精确等于某个选项值**才可信；
+        #    像"书=23但选项没有23"这种明显虚高(清单重复/误配)，丢弃代码结果交给模型看图。
         code = self._code_count(question, inventory, stats)
-        if code is not None:
-            logger.info("代码计数命中：q={!r} -> {}", question[:36], code)
-            return code
-        # 2) 兜不住才调一次 VLM
+        cn = self._to_number(code)
+        if code is not None and cn is not None:
+            if not options or any(abs(v - cn) < 1e-6 for v in options.values()):
+                logger.info("代码计数命中：q={!r} -> {}", question[:36], code)
+                return code
+            logger.info("代码计数 {} 不在选项值内，弃用改走模型看图", code)
+        # 2) 模型兜底（带巡游抓取的视角图，识别 shape 缺失的类别）
         parsed = self._ask_vlm(subject, question, inventory, stats, options)
         if not isinstance(parsed, dict):
             return None
@@ -494,13 +546,13 @@ class CountingAgent(AgentBase):
     # ------------------------------------------------------------------ #
     # 感知：零 VLM。原地 360° + 以"走到物体旁"为航点巡游，合并去重破除遮挡，一次建主清单复用。
     # ------------------------------------------------------------------ #
-    def _spin_sweep(self, capture_image: bool = False) -> None:
-        # 当前为纯文本回答，默认不再抓图（capture_image=True 时才抓，且只在第 1 视角抓）
+    def _spin_sweep(self, capture_image: bool = True) -> None:
         views = max(int(self.cfg.sweep_views), 1)
         step = float(self.cfg.sweep_turn_degrees)
+        phase = (getattr(self, "_roam_phase", 0) * 37.0) % 360.0  # 重试轮换相位，覆盖不同缝隙
         for i in range(views):
             try:
-                self.tongsim.turn_in_degree(self.character_id, (step * i) % 360.0)  # 绝对朝向
+                self.tongsim.turn_in_degree(self.character_id, (phase + step * i) % 360.0)  # 绝对朝向
             except Exception as exc:
                 logger.warning("转向失败（第 {} 视角）：{}", i, exc)
             time.sleep(float(self.cfg.turn_settle_s))
@@ -518,27 +570,57 @@ class CountingAgent(AgentBase):
             logger.info("命中主清单缓存：{} 件（跳过巡游）", len(cached))
             return self._master
 
-        # 2) 轻量巡游：原地一圈 + 少量短跳补视角（每个新位置抓 1 张图）
+        # 2) 4点法巡游：出生点转3张拿bbox → 3个角(朝中心拍1张) + 房间中心(3张×120°)
+        #    家具点全部去掉；走完若清单过少则补看最大件家具背视点(安全网)
         self._obj_memory = {}
         self._view_images = []
-        self._spin_sweep()  # 出生点先原地一圈（抓 1 张图）
+        self._spin_sweep()  # 出生点 3 张，建立初始清单与 bbox
 
-        budget = time.time() + float(self.cfg.roam_time_budget_s)
-        hop = float(self.cfg.roam_hop_cm)
-        for h in range(max(int(self.cfg.roam_hops), 0)):
+        budget = time.time() + float(getattr(self, "_roam_budget", None) or self.cfg.roam_time_budget_s)
+        points, center = self._plan_viewpoints()
+        logger.info("规划观察点 {} 个: {}", len(points), [(int(p[0]), int(p[1]), m) for p, m in points])
+        dead: set = getattr(self, "_dead_points", None) or set()
+        self._dead_points = dead
+        for k, (p, mode) in enumerate(points):
             if time.time() > budget or len(self._obj_memory) >= int(self.cfg.max_inventory_items):
                 break
+            tag = (int(p[0]), int(p[1]))
+            if tag in dead:
+                logger.info("观察点#{} {} 在黑名单(曾不可达)，跳过", k, tag)
+                continue
             before = len(self._obj_memory)
-            heading = (120.0 * h) % 360.0
-            # 朝该方向短跳 → 复扫 → 折返，回到出生点附近再换下一个方向
-            if self._hop_out(heading, hop):
-                self._spin_sweep()
-                self._hop_out(heading + 180.0, hop)
+            ok = self._goto_point(p)
+            if ok:
+                if mode == "center":
+                    self._spin_sweep()          # 中心 360° = 3张×120°
+                else:
+                    self._observe_toward(center)  # 角落：朝中心拍 1 张(FOV120 覆盖朝内90°)
             gained = len(self._obj_memory) - before
-            logger.info("短跳 hop#{} 方向{}°：新增 {} 件，累计 {} 件", h, int(heading), gained, len(self._obj_memory))
-            if gained == 0 and h > 0 and len(self._obj_memory) < 8:
-                # 连续没新增且清单偏少，可能撞墙困住，停
-                break
+            logger.info("观察点#{} ({},{},{}) 导航{} 新增 {} 件，累计 {} 件", k, tag[0], tag[1], mode, "ok" if ok else "FAIL", gained, len(self._obj_memory))
+            if not ok:
+                dead.add(tag)
+
+        # —— 安全网：清单过少 → 补看最大件家具的背视点（每点 1 张，朝中心）——
+        if len(self._obj_memory) < int(self.cfg.min_inventory_items):
+            logger.warning("清单仅 {} 件(<{}), 启动安全网", len(self._obj_memory), self.cfg.min_inventory_items)
+            for f in self._furniture_desc(up_to=int(self.cfg.safety_back_views)):
+                if time.time() > budget:
+                    break
+                fx, fy = f["pos"][0], f["pos"][1]
+                bx = fx + (fx - center[0]) * 0.45
+                by = fy + (fy - center[1]) * 0.45
+                bx += (center[0] - bx) * 0.15
+                by += (center[1] - by) * 0.15
+                back = [bx, by, center[2]]
+                tag = (int(back[0]), int(back[1]))
+                if tag in dead:
+                    continue
+                before = len(self._obj_memory)
+                if not self._goto_point(back):
+                    dead.add(tag)
+                    continue
+                self._observe_toward(center)
+                logger.info("安全网 家具背视({},{}): 新增 {} 件，累计 {} 件", tag[0], tag[1], len(self._obj_memory) - before, len(self._obj_memory))
 
         self._master = list(self._obj_memory.values())
         self._master_stats = self._group_stats(self._master)
@@ -546,10 +628,128 @@ class CountingAgent(AgentBase):
         self._save_master_cache(self._master)
         return self._master
 
-    def _build_master_with_retry(self, t_session_start: float, min_items: int = 8, tries: int = 3) -> bool:
-        """带重试的主清单构建：感知故障/清单过空时快速失败返回 False，绝不拿空清单去答题。"""
+    def _observe_toward(self, target: list[float]) -> None:
+        """原地转向 target 方向后拍摄 1 张(FOV 120° 足够覆盖该角朝内的 90°)。"""
+        import math
+        me = self._current_xy()
+        heading = math.degrees(math.atan2(target[1] - me[1], target[0] - me[0]))
+        try:
+            self.tongsim.turn_in_degree(self.character_id, heading % 360.0)
+        except Exception as exc:
+            logger.warning("转向失败: {}", exc)
+        time.sleep(float(self.cfg.turn_settle_s))
+        self._perceive_into_memory(capture_image=True)
+
+    def _current_xy(self) -> list[float]:
+        return list(getattr(self, "_last_nav_xy", None) or getattr(self, "_spawn_xy", [0.0, 0.0]))
+
+    def _furniture_desc(self, up_to: int = 2) -> list[dict[str, Any]]:
+        objs = list(self._obj_memory.values())
+        return sorted((it for it in objs if self._looks_like_furniture(it)),
+                      key=lambda it: max(it["size"]), reverse=True)[:up_to]
+
+
+    def _plan_viewpoints(self):
+        """4点法：bbox四角 → 排除"床角"(shape/name 含 bed；认不出用最大件家具代理) →
+        其余3角朝中心内缩 inset + 可落点校验；再加房间正中心(360°)。
+        返回 ([(点, mode)], 中心点)。"""
+        objs = list(self._obj_memory.values())
+        z = float(getattr(self, "_spawn_z", 20.0))
+        if not objs:
+            return [], [0.0, 0.0, z]
+        xs = [it["pos"][0] for it in objs]
+        ys = [it["pos"][1] for it in objs]
+        xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
+        inset = float(self.cfg.roam_inset_cm)
+        cx, cy = (xmin + xmax) / 2.0, (ymin + ymax) / 2.0
+        center = [cx, cy, z]
+        self._room_center = center
+
+        corners = [[xmin, ymin], [xmax, ymin], [xmin, ymax], [xmax, ymax]]
+        # 床角判定：shape/name 含 bed；否则最大件家具代理
+        bed = next((it for it in objs
+                    if "bed" in str(it.get("shape", "")).lower() or "bed" in str(it.get("name", "")).lower()), None)
+        anchor = bed
+        if anchor is None:
+            furns = sorted((it for it in objs if self._looks_like_furniture(it)),
+                           key=lambda it: max(it["size"]), reverse=True)
+            anchor = furns[0] if furns else None
+        if anchor is not None:
+            ax, ay = float(anchor["pos"][0]), float(anchor["pos"][1])
+            logger.info("床角判定: 依据 {} (含bed={}) 位置({},{}), 排除离它最近的角",
+                        anchor.get("id"), bool(bed), int(ax), int(ay))
+            corners.sort(key=lambda c: (c[0] - ax) ** 2 + (c[1] - ay) ** 2, reverse=True)  # 远的在前
+        keep = corners[:3]
+
+        pts: list[tuple[list[float], str]] = []
+        for c in keep:
+            dx, dy = cx - c[0], cy - c[1]
+            d = max((dx * dx + dy * dy) ** 0.5, 1e-6)
+            step = min(inset, d * 0.8)
+            q = [c[0] + dx / d * step, c[1] + dy / d * step, z]
+            q = self._adjust_point(q, objs, center)
+            if q is not None:
+                pts.append((q, "corner"))
+        cq = self._adjust_point([cx, cy, z], objs, center)
+        if cq is not None:
+            pts.append((cq, "center"))
+
+        spawn = self._current_xy()
+        order: list[tuple[list[float], str]] = []
+        cur = spawn
+        pool = pts[:]
+        while pool:
+            nxt = min(pool, key=lambda pc: (pc[0][0] - cur[0]) ** 2 + (pc[0][1] - cur[1]) ** 2)
+            pool.remove(nxt)
+            order.append(nxt)
+            cur = [nxt[0][0], nxt[0][1]]
+        return order[: max(int(self.cfg.roam_max_points), 0)], center
+
+    def _adjust_point(self, q: list[float], objs: list[dict[str, Any]], center: list[float]):
+        """可落点校验：压到物体就朝中心回缩，最多5次；仍不行返回 None。"""
+        for _ in range(5):
+            if self._point_blocked(q[0], q[1], objs) is None:
+                return q
+            q = [q[0] + (center[0] - q[0]) * 0.3, q[1] + (center[1] - q[1]) * 0.3, q[2]]
+        return None
+
+
+    def _point_blocked(self, x: float, y: float, objs: list[dict[str, Any]], pad: float = 45.0) -> str | None:
+        """点是否压在某个物体的占地(含角色体宽 pad)里。返回挡住它的物体id或 None。"""
+        for it in objs:
+            sx, sy = it["size"][0], it["size"][1]
+            if max(sx, sy) < 30:      # 小物件不挡路
+                continue
+            hx, hy = sx / 2.0 + pad, sy / 2.0 + pad
+            if abs(x - it["pos"][0]) <= hx and abs(y - it["pos"][1]) <= hy:
+                return it["id"]
+        return None
+
+    def _goto_point(self, p: list[float]) -> bool:
+        try:
+            res = self.tongsim.move_to_location(
+                self.character_id, [float(p[0]), float(p[1]), float(p[2])], stop_distance=1.2
+            )
+            time.sleep(0.3)
+            ok = not (isinstance(res, dict) and res.get("result") == "failed")
+            if ok:
+                self._last_nav_xy = [float(p[0]), float(p[1])]
+            return ok
+        except Exception as exc:
+            logger.warning("move_to_location({},{}) 异常: {}", int(p[0]), int(p[1]), exc)
+            return False
+
+
+    def _build_master_with_retry(self, t_session_start: float, min_items: int = 8, tries: int = 3,
+                                 force_rebuild: bool = True) -> bool:
+        """带重试的主清单构建：感知故障/清单过空时快速失败返回 False，绝不拿空清单去答题。
+        force_rebuild=False 时若已有清单则直接复用（第4次"只换问法不重巡"用）。"""
+        if not force_rebuild and (self._master or []):
+            self._perceive_fail_streak = 0
+            return len(self._master) >= min_items or self._perceive_fail_streak == 0
         for k in range(tries):
-            self._master = None
+            if force_rebuild:
+                self._master = None
             self._perceive_fail_streak = 0
             inv = self._ensure_master()
             if len(inv) >= min_items and self._perceive_fail_streak < 4:
@@ -559,21 +759,6 @@ class CountingAgent(AgentBase):
                 break
             time.sleep(5.0)
         return False
-
-    def _answered_inventory_ok(self) -> list[dict[str, Any]]:
-        return self._master or []
-
-    def _hop_out(self, heading_deg: float, distance_cm: float) -> bool:
-        """转向到 heading 后短距离前进；成功 True。比 move_to_object 快很多。"""
-        try:
-            self.tongsim.turn_in_degree(self.character_id, float(heading_deg) % 360.0)
-            time.sleep(float(self.cfg.turn_settle_s))
-            res = self.tongsim.move_forward(self.character_id, float(distance_cm))
-            time.sleep(0.2)
-            return not (isinstance(res, dict) and res.get("result") == "failed")
-        except Exception as exc:
-            logger.warning("短跳失败(heading={}): {}", int(heading_deg), exc)
-            return False
 
     # ---- 主清单磁盘缓存 ---- #
     def _cache_file(self) -> str:
@@ -619,10 +804,12 @@ class CountingAgent(AgentBase):
         except Exception as exc:
             logger.warning("写入主清单缓存失败: {}", exc)
 
-    def invalidate_master_cache(self) -> None:
-        """答错时调用：丢弃内存+磁盘缓存，强制下次重新巡游（怀疑漏检）。"""
+    def invalidate_master_cache(self, silent: bool = False) -> None:
+        """丢弃内存清单(下次作答重新感知)。silent=True 用于常规换题/重试，不算故障。"""
         self._master = None
         self._master_stats = None
+        if silent:
+            return
         try:
             path = self._cache_file()
             if os.path.exists(path):
@@ -804,16 +991,24 @@ class CountingAgent(AgentBase):
             "【题目原文】\n"
             f"{question}\n\n"
             f"{opts_line}"
-            "【代码预计算的分组统计(可核对，但以物体清单为准)】\n"
+            "【证据1：巡游多个位置拍摄的第一视角图】左侧真实画面，右侧是按数字 id 标注的语义分割图。\n"
+            "【证据2：代码预计算统计】\n"
             f"{json.dumps(stats, ensure_ascii=False)}\n\n"
-            "【场景全部可见物体清单】(每项含 id/color/shape/name)\n"
+            "【证据3：物体清单 id 索引】(注意 color/shape 常为 Unknown 或只标几何形状，**类别以看图为准**)\n"
             f"{json.dumps(slim, ensure_ascii=False)}\n\n"
-            "【输出要求】先数出目标数量，再在选项中选出对应答案。只输出一个 JSON 对象：\n"
-            '{"think":"简短计数推理","count":数字,"option":"选项字母"}'
+            "【计数规则】1) 以图片认出目标类别的物体，对照分割图记下其 id；同一 id 跨图只计 1 次。"
+            "2) 不把家具(桌/柜/床/椅等大件)算进目标，除非题目问的就是家具。"
+            "3) 拿不准是否属于目标类别的物体宁缺勿滥。4) 数出 count 后，选出数值等于 count 的选项字母。\n"
+            "只输出一个 JSON 对象：\n"
+            '{"think":"引用图中看到的物体id说明计数依据","count":数字,"option":"选项字母"}'
         )
+        content: list[dict[str, Any]] = []
+        for url in self._view_images[: int(self.cfg.max_answer_images)]:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        content.append({"type": "text", "text": user_text})
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},  # 纯文本(回退到上次可正常作答的版本)
+            {"role": "user", "content": content},  # 图+清单：识别 shape 字段缺失的类别(钟/碗/瓶)
         ]
         try:
             response = self.vlm_client.invoke(messages)
@@ -877,9 +1072,10 @@ class CountingAgent(AgentBase):
         except Exception as exc:
             logger.warning("加载系统提示失败({})，使用内置默认", exc)
             return (
-                "你是严谨的场景计数助手。依据结构化物体清单(id/color/shape/name)与代码统计计数，"
-                "同一 id 只数一次，不把家具算进目标；数出数量后在选项里选数值等于该数量的字母。只输出 JSON："
-                '{"think":"推理","count":数字,"option":"字母"}。'
+                "你是严谨的场景计数助手。综合多视角图(含带id分割图)与清单(id/color/shape)计数："
+                "类别以看图为准(Unknown不代表不是目标)；同一 id 只数一次；镜面反射不是新物体，按 id 判重；"
+                "不把家具算进目标；数出数量后选数值恰等于该数量的选项字母。只输出 JSON："
+                '{"think":"引用id与图号","count":数字,"option":"字母"}。'
             )
 
     # ------------------------------------------------------------------ #

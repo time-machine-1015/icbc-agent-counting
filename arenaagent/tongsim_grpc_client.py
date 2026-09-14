@@ -195,6 +195,7 @@ class TongSimGrpcClient(TongSimInterface):
                 "target_location": target_location,
                 "stop_distance": stop_distance,
             },
+            timeout_s=20.0,
         )
 
     def move_forward(self, character_id, distance: float):

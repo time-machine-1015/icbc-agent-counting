@@ -37,10 +37,10 @@ max_vlm_fail_streak = 3
 sweep_turn_degrees = 120.0
 sweep_views = 3
 turn_settle_s = 0.12
-# 轻量巡游：原地一圈 + 少量短跳(快)，取代逐个 move_to_object(慢寻路)
-roam_time_budget_s = 70.0
-roam_hops = 3
-roam_hop_cm = 240.0
+# 航点巡游：首圈拿世界坐标→中心/家具前视/四角观察点，move_to_location 引擎寻路(自动绕墙)
+roam_time_budget_s = 95.0
+roam_max_points = 4
+roam_inset_cm = 120.0
 per_attempt_budget_s = 150.0
 # 多题节奏：答对才推进；evaluate 后等题号变化的宽限
 max_attempts_per_subject = 4
@@ -48,7 +48,8 @@ advance_wait_s = 6.0
 perceive_width = 480
 perceive_height = 400
 max_inventory_items = 200
-max_answer_images = 5
+max_answer_images = 2
+min_inventory_items = 15
 
 [grpc]
 endpoint = "127.0.0.1:50051"
